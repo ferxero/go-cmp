@@ -21,11 +21,6 @@ type formatValueOptions struct {
 	// methods like error.Error or fmt.Stringer.String.
 	AvoidStringer bool
 
-	// PrintShallowPointer controls whether to print the next pointer.
-	// Useful when printing map keys, where pointer comparison is performed
-	// on the pointer address rather than the pointed-at value.
-	PrintShallowPointer bool
-
 	// PrintAddresses controls whether to print the address of all pointers,
 	// slice elements, and maps.
 	PrintAddresses bool
@@ -77,23 +72,39 @@ func (opts formatOptions) FormatType(t reflect.Type, s textNode) textNode {
 	}
 
 	// Avoid wrap the value in parenthesis if unnecessary.
-	if s, ok := s.(textWrap); ok {
-		hasParens := strings.HasPrefix(s.Prefix, "(") && strings.HasSuffix(s.Suffix, ")")
-		hasBraces := strings.HasPrefix(s.Prefix, "{") && strings.HasSuffix(s.Suffix, "}")
-		if hasParens || hasBraces {
-			return textWrap{typeName, s, ""}
-		}
+	var hasParens, hasBraces bool
+	// TODO: What about empty pointer nodes?
+	if s, ok := s.(*textWrap); ok {
+		hasParens = strings.HasPrefix(s.Prefix, "(") && strings.HasSuffix(s.Suffix, ")")
+		hasBraces = strings.HasPrefix(s.Prefix, "{") && strings.HasSuffix(s.Suffix, "}")
 	}
-	return textWrap{typeName + "(", s, ")"}
+	if !(hasParens || hasBraces) {
+		s = &textWrap{Prefix: "(", Value: s, Suffix: ")"}
+	}
+	return &textWrap{Prefix: typeName, Value: s}
 }
 
 // FormatValue prints the reflect.Value, taking extra care to avoid descending
-// into pointers already in m. As pointers are visited, m is also updated.
-func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visitedPointers) (out textNode) {
+// into pointers already in ptrs. As pointers are visited, ptrs is also updated.
+func (opts formatOptions) FormatValue(v reflect.Value, parentKind reflect.Kind, ptrs *pointerReferences) (out textNode) {
 	if !v.IsValid() {
 		return nil
 	}
 	t := v.Type()
+
+	// Check slice element for cycles.
+	if parentKind == reflect.Slice {
+		var ptrPrefix string
+		if opts.PrintAddresses {
+			ptrPrefix = formatPointer(v.Addr())
+		}
+		ptrRef, visited := ptrs.Push(v.Addr())
+		if visited {
+			return &textWrap{Prefix: ptrPrefix + "(", Value: textEllipsis, Suffix: ")", Metadata: ptrRef}
+		}
+		defer ptrs.Pop()
+		defer func() { out = &textWrap{Prefix: ptrPrefix, Value: out, Metadata: ptrRef} }()
+	}
 
 	// Check whether there is an Error or String method to call.
 	if !opts.AvoidStringer && v.CanInterface() {
@@ -128,7 +139,6 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 		}
 	}()
 
-	var ptr string
 	switch t.Kind() {
 	case reflect.Bool:
 		return textLine(fmt.Sprint(v.Bool()))
@@ -137,7 +147,7 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 	case reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return textLine(fmt.Sprint(v.Uint()))
 	case reflect.Uint8:
-		if withinSlice {
+		if parentKind == reflect.Slice || parentKind == reflect.Array {
 			return textLine(formatHex(v.Uint()))
 		}
 		return textLine(fmt.Sprint(v.Uint()))
@@ -179,16 +189,13 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 			if supportExporters && !isExported(sf.Name) {
 				vv = retrieveUnexportedField(v, sf, true)
 			}
-			s := opts.WithTypeMode(autoType).FormatValue(vv, false, m)
+			s := opts.WithTypeMode(autoType).FormatValue(vv, t.Kind(), ptrs)
 			list = append(list, textRecord{Key: sf.Name, Value: s})
 		}
-		return textWrap{"{", list, "}"}
+		return &textWrap{Prefix: "{", Value: list, Suffix: "}"}
 	case reflect.Slice:
 		if v.IsNil() {
 			return textNil
-		}
-		if opts.PrintAddresses {
-			ptr = fmt.Sprintf("⟪ptr:0x%x, len:%d, cap:%d⟫", pointerValue(v), v.Len(), v.Cap())
 		}
 		fallthrough
 	case reflect.Array:
@@ -203,29 +210,31 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 				list.AppendEllipsis(diffStats{})
 				break
 			}
-			vi := v.Index(i)
-			if vi.CanAddr() { // Check for cyclic elements
-				p := vi.Addr()
-				if m.Visit(p) {
-					var out textNode
-					out = textLine(formatPointer(p))
-					out = opts.WithTypeMode(emitType).FormatType(p.Type(), out)
-					out = textWrap{"*", out, ""}
-					list = append(list, textRecord{Value: out})
-					continue
-				}
-			}
-			s := opts.WithTypeMode(elideType).FormatValue(vi, true, m)
+			s := opts.WithTypeMode(elideType).FormatValue(v.Index(i), t.Kind(), ptrs)
 			list = append(list, textRecord{Value: s})
 		}
-		return textWrap{ptr + "{", list, "}"}
+
+		out = &textWrap{Prefix: "{", Value: list, Suffix: "}"}
+		if t.Kind() == reflect.Slice && opts.PrintAddresses {
+			header := fmt.Sprintf("ptr:%v, len:%d, cap:%d", formatHex(uint64(pointerValue(v))), v.Len(), v.Cap())
+			out = &textWrap{Prefix: pointerDelimStart + header + pointerDelimEnd, Value: out}
+		}
+		return out
 	case reflect.Map:
 		if v.IsNil() {
 			return textNil
 		}
-		if m.Visit(v) {
-			return textLine(formatPointer(v))
+
+		// Check pointer for cycles.
+		var ptrPrefix string
+		if opts.PrintAddresses {
+			ptrPrefix = formatPointer(v)
 		}
+		ptrRef, visited := ptrs.Push(v)
+		if visited {
+			return &textWrap{Prefix: ptrPrefix + "(", Value: textEllipsis, Suffix: ")", Metadata: ptrRef}
+		}
+		defer ptrs.Pop()
 
 		maxLen := v.Len()
 		if opts.LimitVerbosity {
@@ -238,27 +247,35 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 				list.AppendEllipsis(diffStats{})
 				break
 			}
-			sk := formatMapKey(k, false)
-			sv := opts.WithTypeMode(elideType).FormatValue(v.MapIndex(k), false, m)
+			sk := formatMapKey(k, false, ptrs)
+			sv := opts.WithTypeMode(elideType).FormatValue(v.MapIndex(k), t.Kind(), ptrs)
 			list = append(list, textRecord{Key: sk, Value: sv})
 		}
-		if opts.PrintAddresses {
-			ptr = formatPointer(v)
-		}
-		return textWrap{ptr + "{", list, "}"}
+
+		out = &textWrap{Prefix: "{", Value: list, Suffix: "}"}
+		out = &textWrap{Prefix: ptrPrefix, Value: out, Metadata: ptrRef}
+		return out
 	case reflect.Ptr:
 		if v.IsNil() {
 			return textNil
 		}
-		if m.Visit(v) {
-			return textLine(formatPointer(v))
+
+		// Check pointer for cycles.
+		var ptrPrefix string
+		if opts.PrintAddresses {
+			ptrPrefix = formatPointer(v)
 		}
-		if opts.PrintAddresses || opts.PrintShallowPointer {
-			ptr = formatPointer(v)
-			opts.PrintShallowPointer = false
+		ptrRef, visited := ptrs.Push(v)
+		if visited {
+			return &textWrap{Prefix: ptrPrefix + "(", Value: textEllipsis, Suffix: ")", Metadata: ptrRef}
 		}
+		defer ptrs.Pop()
+
 		skipType = true // Let the underlying value print the type instead
-		return textWrap{"&" + ptr, opts.FormatValue(v.Elem(), false, m), ""}
+		out = opts.FormatValue(v.Elem(), t.Kind(), ptrs)
+		out = &textWrap{Prefix: ptrPrefix, Value: out, Metadata: ptrRef}
+		out = &textWrap{Prefix: "&", Value: out}
+		return out
 	case reflect.Interface:
 		if v.IsNil() {
 			return textNil
@@ -266,7 +283,7 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 		// Interfaces accept different concrete types,
 		// so configure the underlying value to explicitly print the type.
 		skipType = true // Print the concrete type instead
-		return opts.WithTypeMode(emitType).FormatValue(v.Elem(), false, m)
+		return opts.WithTypeMode(emitType).FormatValue(v.Elem(), t.Kind(), ptrs)
 	default:
 		panic(fmt.Sprintf("%v kind not handled", v.Kind()))
 	}
@@ -274,14 +291,14 @@ func (opts formatOptions) FormatValue(v reflect.Value, withinSlice bool, m visit
 
 // formatMapKey formats v as if it were a map key.
 // The result is guaranteed to be a single line.
-func formatMapKey(v reflect.Value, disambiguate bool) string {
+func formatMapKey(v reflect.Value, disambiguate bool, ptrs *pointerReferences) string {
 	var opts formatOptions
 	opts.DiffMode = diffIdentical
 	opts.TypeMode = elideType
-	opts.PrintShallowPointer = true
+	opts.PrintAddresses = disambiguate
 	opts.AvoidStringer = disambiguate
 	opts.QualifiedNames = disambiguate
-	s := opts.FormatValue(v, false, visitedPointers{}).String()
+	s := opts.FormatValue(v, reflect.Map, ptrs).String()
 	return strings.TrimSpace(s)
 }
 
@@ -329,9 +346,14 @@ func formatHex(u uint64) string {
 	return fmt.Sprintf(f, u)
 }
 
+const (
+	pointerDelimStart = "⟪"
+	pointerDelimEnd   = "⟫"
+)
+
 // formatPointer prints the address of the pointer.
 func formatPointer(v reflect.Value) string {
-	return fmt.Sprintf("⟪0x%x⟫", pointerValue(v))
+	return pointerDelimStart + formatHex(uint64(pointerValue(v))) + pointerDelimEnd
 }
 func pointerValue(v reflect.Value) uintptr {
 	p := v.Pointer()
@@ -339,15 +361,4 @@ func pointerValue(v reflect.Value) uintptr {
 		p = 0xdeadf00f // Only used for stable testing purposes
 	}
 	return p
-}
-
-type visitedPointers map[value.Pointer]struct{}
-
-// Visit inserts pointer v into the visited map and reports whether it had
-// already been visited before.
-func (m visitedPointers) Visit(v reflect.Value) bool {
-	p := value.PointerOf(v)
-	_, visited := m[p]
-	m[p] = struct{}{}
-	return visited
 }

@@ -1380,7 +1380,7 @@
 + 									},
 + 									"Buzz": &{
 + 										Name:   "Buzz",
-+ 										Bravos: map[string]*cmp_test.CycleBravo{"BarBuzzBravo": ⟪0xdeadf00f⟫, "BuzzBarBravo": ⟪0xdeadf00f⟫},
++ 										Bravos: map[string]*cmp_test.CycleBravo{"BarBuzzBravo": &{...}, "BuzzBarBravo": &{...}},
 + 									},
 + 								},
   							},
@@ -1429,7 +1429,7 @@
 + 					},
 + 					"Buzz": &{
 + 						Name:   "Buzz",
-+ 						Bravos: map[string]*cmp_test.CycleBravo{"BarBuzzBravo": ⟪0xdeadf00f⟫, "BuzzBarBravo": ⟪0xdeadf00f⟫},
++ 						Bravos: map[string]*cmp_test.CycleBravo{"BarBuzzBravo": &{...}, "BuzzBarBravo": &{...}},
 + 					},
 + 				},
   			},
